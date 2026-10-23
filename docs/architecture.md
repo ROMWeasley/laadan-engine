@@ -16,7 +16,7 @@ The central engineering constraint is **Zero Eval with Maximum UI Capability**:
 ### Core System Invariants
 
 1. **Zero Client-Side Code Generation:** The browser runs a single, fixed Vanilla JS runtime (`laadan-client.js`, ~4 KB) using event delegation (`data-laadan-*` attributes) and live DOM morphing. The language model emits zero executable scripts.
-2. **Evidential Taint Tracking (`@we` $\rightarrow$ `@wi`):** All model output starts as conjectural data (`@we`). It cannot mutate state or reach the client until validated and compiled by deterministic server code into verified output (`@wi`).
+2. **Evidential Taint Tracking (`@we` → `@wi`):** All model output starts as conjectural data (`@we`). It cannot mutate state or reach the client until validated and compiled by deterministic server code into verified output (`@wi`).
 3. **Two-Tier Capability Dispatch:** Client actions resolve either through a deterministic server-side **Fast-Path** (zero LLM tokens) or through a schema-bounded **Generative Intent Handler** that updates state and requests a typed UI patch from the model.
 4. **Loopback & Offline by Default:** The server binds to `127.0.0.1` and defaults to `LAADAN_EXECUTION_MODE=mock`. External LLM calls are opt-in.
 
@@ -107,21 +107,45 @@ Created in 1982 by linguist and feminist author Suzette Haden Elgin, the constru
 
 To make the boundary between probabilistic model outputs and deterministic execution explicit, the runtime can be viewed as a typed state machine over application state $S_t$ (the `CarrierBag`) and client view $V_t$:
 
-1. **Ingress Parsing ($\mathcal{T}_{\text{wahel}} \rightarrow \mathcal{T}_{\text{wa}}$):**
-   An incoming request $r \in \mathcal{T}_{\text{wahel}}$ is parsed by a strict Pydantic validator $\phi_{\text{in}}$:
-   $$a_{\text{wa}} = \phi_{\text{in}}(r)$$
-   If validation fails, the request is rejected at the gateway before touching state or models.
+#### Ingress Parsing (`@wahel` → `@wa`)
+An incoming raw request $r \in \mathcal{T}_{\text{wahel}}$ is parsed by a strict Pydantic validator $\phi_{\text{in}}$:
 
-2. **Two-Tier Dispatch (Fast-Path vs. Model Path):**
-   * **Deterministic Fast-Path:** If the action $a_{\text{wa}}$ uses a local primitive (e.g., `ui.toggle`, `ui.switch_tab`), the transition function $\delta_{\text{fast}}$ computes the next state and view directly without calling the model:
-     $$(S_{t+1}, V_{t+1}^{\text{wi}}) = \delta_{\text{fast}}(S_t, a_{\text{wa}})$$
-   * **Generative Path:** For open-ended routes or domain intents, the model gateway $M$ proposes a candidate AST and state delta typed as `@we`:
-     $$p_{\text{we}} \sim M(S_t, a_{\text{wa}}, C_{\text{assets}})$$
-     Because $p_{\text{we}} \in \mathcal{T}_{\text{we}}$ ("seen in a dream"), it cannot be sent to the browser directly. It must pass through the deterministic compiler $\kappa$ (Pydantic AST validation + `nh3` sanitization + asset resolution), with fallback boundary $B_{\text{glitch}}$ on failure:
-     $$(S_{t+1}, V_{t+1}^{\text{wi}}) = \begin{cases} \kappa(S_t, p_{\text{we}}) & \text{if } p_{\text{we}} \text{ is schema- and AST-valid} \\ (S_t, B_{\text{glitch}}(p_{\text{we}})) & \text{otherwise} \end{cases}$$
+$$
+a_{\text{wa}} = \phi_{\text{in}}(r)
+$$
 
-3. **Rate-Limit Coalescing (`batched` mode):**
-   When a user triggers a burst of actions $(a_1, a_2, \dots, a_k)$ within a debounce window $\Delta t$ (e.g., `250 ms`), the coalescing buffer folds them into a single composite intent $\tilde{a} = a_1 \oplus a_2 \oplus \dots \oplus a_k$ before invoking $M$ once, keeping request volume within strict provider RPM limits.
+If validation fails, the request is rejected at the gateway before touching state or models.
+
+#### Two-Tier Dispatch: Fast-Path vs. Generative Path
+
+**Deterministic Fast-Path:** If the action $a_{\text{wa}}$ uses a local UI primitive (such as `ui.toggle` or `ui.switch_tab`), the transition function $\delta_{\text{fast}}$ computes the next state and view directly without calling the model:
+
+$$
+(S_{t+1}, V_{t+1}^{\text{wi}}) = \delta_{\text{fast}}(S_t, a_{\text{wa}})
+$$
+
+**Generative Path:** For open-ended routes or domain intents, the model gateway $M$ proposes a candidate AST and state delta typed as conjectural (`@we`):
+
+$$
+p_{\text{we}} \sim M(S_t, a_{\text{wa}}, C_{\text{assets}})
+$$
+
+Because $p_{\text{we}} \in \mathcal{T}_{\text{we}}$ ("seen in a dream"), it cannot be sent to the browser directly. It must pass through the deterministic compiler $\kappa$ (Pydantic AST validation + `nh3` sanitization + asset resolution), with fallback boundary $B_{\text{glitch}}$ on failure:
+
+$$
+(S_{t+1}, V_{t+1}^{\text{wi}}) = 
+\begin{cases} 
+\kappa(S_t, p_{\text{we}}) & \text{if } p_{\text{we}} \text{ is valid} \\
+(S_t, B_{\text{glitch}}(p_{\text{we}})) & \text{otherwise} 
+\end{cases}
+$$
+
+#### Rate-Limit Coalescing (`batched` mode)
+When a user triggers a burst of actions $(a_1, a_2, \dots, a_k)$ within a debounce window $\Delta t$ (e.g. 250 ms), the coalescing buffer folds them into a single composite intent before invoking $M$ once, keeping request volume within strict provider RPM limits:
+
+$$
+\tilde{a} = a_1 \oplus a_2 \oplus \dots \oplus a_k
+$$
 
 ---
 

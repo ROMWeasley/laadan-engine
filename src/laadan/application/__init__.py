@@ -1,5 +1,6 @@
 """Laadan Application Layer.
 
-Orchestrates workflows, intent dispatching, action coalescing, and page document rendering.
-Coordinates between domain rules and external infrastructure ports.
+Use cases (load page, run action, answer API request), context building,
+rate limiting, and batching. Defines the ports implemented by adapters:
+ModelGateway, PageStore, and EntityStore.
 """

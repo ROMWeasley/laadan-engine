@@ -1,8 +1,7 @@
 """Laadan Adapters Layer (Ports & Adapters Architecture).
 
-Houses all inbound and outbound technical adapters that interface with the external world:
-- inbound: `web` (FastAPI ASGI gateway, routes, and static assets)
-- outbound: `models` (Mock and external model gateways)
-- outbound: `storage` (SQLite and in-memory persistence)
-- outbound: `security` (nh3 AST-level HTML sanitization)
+Technical adapters that connect the application to the outside world:
+- inbound: `web` (FastAPI app, security headers, origin checks, static files, client script)
+- outbound: `models` (mock gateway and OpenAI-compatible HTTP gateway)
+- outbound: `storage` (SQLite entity store and page store)
 """

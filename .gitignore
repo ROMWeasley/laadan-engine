@@ -27,8 +27,15 @@ htmlcov/
 !.env.example
 .pypirc
 
+# Local data (SQLite entity and page store)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
 # Local editor and operating-system files
 .idea/
+.vscode/
 .DS_Store
 Thumbs.db
 *.swp
@@ -36,5 +43,3 @@ Thumbs.db
 
 # Runtime output
 *.log
-dump.rdb
-appendonly.aof

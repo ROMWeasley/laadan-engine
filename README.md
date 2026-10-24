@@ -1,103 +1,117 @@
 # laadan-engine
 
-**A deterministic, server-driven web runtime for generative web interfaces with zero-eval client safety**
+**A server-driven runtime for model-generated web interfaces, designed so that model output is never executed.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Architecture%20%26%20Spec-orange.svg)](#roadmap)
+[![Status](https://img.shields.io/badge/Status-Design%20Phase-orange.svg)](#roadmap)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](pyproject.toml)
 
 ---
 
 ## Overview
 
-`laadan-engine` is an experimental "vibe-server" runtime: navigate to any route in a browser (`/whatsapp`, `/instagram`, `/kanban`), click a button, or send an arbitrary request via Postman or `curl`, and the server dynamically generates interactive web pages, partial DOM updates, or structured API responses on the fly.
+`laadan-engine` is an experimental vibe-server: open any route in a browser (`/whatsapp`, `/kanban`), click a button, or send a request with `curl` or Postman, and the server generates a page, a partial page update, or a JSON response on the fly.
 
-Most generative web experiments achieve interactivity by letting a language model emit raw HTML and executable JavaScript (`eval`, inline `onclick` handlers, dynamic `<script>` tags). That approach turns every prompt injection or hallucination into Cross-Site Scripting (XSS), UI redressing, or data exfiltration.
+The obvious way to build this is to let a language model write HTML and JavaScript and pass it to the browser. Every hallucination or prompt injection then becomes code running in the browser.
 
-`laadan-engine` enforces a strict architectural boundary: **The language model never emits executable code. It proposes structured data and component trees, while the server handles validation, state transitions, and HTML rendering.**
+This project draws one hard line:
+
+> The model produces data, never code. The server validates that data against a fixed set of components and renders all HTML itself.
+
+The browser runs one small, fixed script. Generated pages contain no model-written scripts, event handlers, styles, or external URLs.
 
 ```mermaid
-flowchart TD
-    User["Browser or API Client"] -->|"1. GET /route or POST Action Envelope"| Server["FastAPI Loopback Gateway"]
-    Server -->|"2. Validate Input (@wa) & Hydrate State"| Kernel["Application Kernel & CarrierBag"]
-    Kernel -->|"3a. Deterministic Fast-Path (0 LLM Tokens)"| Compiler["Page Compiler & nh3 Sanitizer"]
-    Kernel -->|"3b. Constrained Generation Request"| Model["Model Gateway (Mock / Direct / Batched)"]
-    Model -->|"4. Untrusted AST Proposal (@we)"| Compiler
-    Compiler -->|"5. Verified HTML Document or DOM Patch (@wi)"| User
+flowchart LR
+    Client["Browser or API client"] -->|"request"| Web["Web adapter"]
+    Web --> App["Application"]
+    App -->|"UI-only action"| Compiler
+    App -->|"needs generation"| Model["Model gateway: mock, direct, batched"]
+    Model -->|"JSON proposal, untrusted"| Compiler["Compiler: validate, render, sanitize, verify"]
+    Compiler -->|"HTML or DOM updates"| Web
+    Web -->|"response"| Client
 ```
 
+## How model output is contained
+
+1. **Typed output.** The model returns JSON that must match a closed component schema (Pydantic v2). Anything else is rejected.
+2. **Server-side rendering.** HTML comes only from the project's own Jinja2 templates with autoescaping. Model text is escaped; model-chosen values such as colors or sizes must match fixed patterns or lists.
+3. **One narrow door for formatting.** `RichText` nodes may contain a few formatting tags. They are cleaned by `nh3` with a minimal allowlist.
+4. **Output check.** Before anything leaves the server, the final HTML is parsed again with `selectolax` and checked for forbidden constructs.
+5. **Browser backstop.** A strict Content Security Policy blocks inline scripts, inline styles, and requests to other origins.
+6. **Server-owned actions.** Buttons carry only an ID. What a button does is stored on the server, not in the page.
+
+Details, including what this design does not cover: [`docs/security-model.md`](docs/security-model.md).
+
 ---
 
-## Naming & Core Metaphor: Why "Láadan"?
+## Láadan
+**Láadan** is a constructed language created in 1982 by linguist and feminist author Suzette Haden Elgin. Designed around radical transparency, its grammar requires speakers to make both their intent and their source of knowledge explicit through mandatory evidential markers. `laadan-engine` applies a related principle to generative web interfaces: a Láadan sentence can carry an *evidential*: a small word stating how the speaker knows what they say. The engine borrows three of them to label where data comes from:
 
-**Láadan** is a constructed language created in 1982 by linguist and feminist author Suzette Haden Elgin. Designed around radical transparency, its grammar requires speakers to make both their intent and their source of knowledge explicit through mandatory evidential markers.
+| Evidential | Meaning in Láadan | Meaning in `laadan-engine` |
+| :--- | :--- | :--- |
+| `wa` | perceived by the speaker | User input: form values, route paths, API request bodies |
+| `we` | perceived in a dream | Anything produced by the model |
+| `wi` | self-evident | Content produced by the server itself |
 
-`laadan-engine` applies a related principle to generative web interfaces: instead of concealing intent inside opaque, model-generated client scripts, user and model interactions are named explicitly as structured actions, typed by evidential origin, and executed deterministically on the server:
+Model output is treated like a dream: possibly vivid, never trusted. The labels travel with stored data and show up in prompts and logs, so a contact the model invented on `/whatsapp` is still marked as dreamed when it reappears on `/instagram`. Security does not depend on these labels; it depends on the typed pipeline above.
 
-1. **Evidential Typing (`@we` $\rightarrow$ `@wi`)**: Language models generate plausible-sounding hallucinations with the same syntactic confidence as facts. In `laadan-engine`, every model output is typed as `@we` (`Evidence.CONJECTURAL` - *"seen in a dream"*). A `@we` value carries zero execution privilege and cannot mutate state or reach the browser until deterministic server compilation and sanitization promote it to `@wi` (`Evidence.VERIFIED`).
-2. **The Carrier Bag vs. The Spear**: Rather than handing a model a "spear" (arbitrary JS `eval`, shell execution, or unconstrained tool calls), the runtime acts as a **Carrier Bag**: a bounded container of pre-verified UI components, validated theme tokens, and shared cross-route state.
-3. **Agentic Action Listeners (`data-laadan-*`)**: Instead of model-generated scripts, the browser runs a fixed, tiny Vanilla JS client (`laadan-client.js`, ~4 KB). Interactive elements use declarative `data-laadan-*` attributes that gather context (button payloads, form inputs, target DOM selectors) and send a structured request to the server, which responds with either a full page or targeted DOM mutations (live DOM morphing without full page reloads).
+**Carrier Bag.** The model gets a bag of prebuilt, safe components to carry its ideas in, instead of a spear to throw at the browser. The image is borrowed from Ursula K. Le Guin's essay *The Carrier Bag Theory of Fiction*. In code, the component catalog is the carrier bag.
+
+**Agentic Action Listeners** are ordinary event listeners, agentified for the occasion: declarative `data-laadan-*` attributes that one fixed script turns into structured requests to the server.
 
 ---
 
-## Planned Architecture & Capabilities
+## Planned Features
 
-* **Typed Component AST + Rust Sanitization (`nh3`)**: To avoid broken HTML-inside-JSON escaping, models emit a typed `PageDocument` tree (`Container`, `Card`, `ActionTrigger`, `TextInput`, `Table`, etc.) validated via Pydantic v2 discriminated unions. Free-text rich formatting is sanitized through `nh3` (Python bindings to Rust's `ammonia`) and inspected with `selectolax`.
-* **Safe Visual Freedom (Bounded Theme Tokens)**: Raw `<style>` tags and `url(...)` rules are blocked to prevent CSS data exfiltration. To keep generated apps visually distinct, models can supply bounded theme tokens (validated hex colors, spacing, and layout presets) compiled into safe `--ldn-*` CSS custom properties alongside a utility class allowlist.
-* **Two-Tier Action Dispatch**:
-  * **Deterministic Fast-Path**: Pure UI state changes (tab switches, accordions, local state toggles) resolve server-side in milliseconds without calling the LLM.
-  * **Generative Intent Actions**: Open-ended domain actions on synthetic routes (e.g., creating a contact or sending a message) pass a schema-validated envelope to the model and state store-enabling arbitrary interactive apps without hardcoding Python controllers for every button.
-* **Cross-App Memory (`CarrierBag`)**: Endpoints retain their state and share a relational SQLite entity store. For example, a contact created on `/whatsapp` is stored in the `CarrierBag` and automatically appears when navigating to `/instagram`.
-* **Progressive Resource Discovery**: Instead of stuffing hundreds of asset descriptions into every prompt, the model can query a local, hash-verified asset catalog (SVGs, icons, dimensions) on demand and embed them via symbolic IDs (`asset:icon-shield`), preventing SSRF and broken external links.
-* **Rate-Limit Execution Modes**: Configurable via `.env` to handle strict provider RPM limits:
-  * `mock`: Offline deterministic fixtures with zero API cost and zero network access (Default).
-  * `direct`: Synchronous model calls for immediate generation.
-  * `batched`: Debounced action coalescing buffer that bundles rapid user clicks into single model requests.
-* **Static Anchor (`index.html`)**: The root route `/` serves a static landing page explaining the engine and providing a safe starting point before branching into dynamically generated routes.
+* **Typed component tree.** Pages are trees of components (`Section`, `Card`, `Button`, `TextInput`, `Table`, ...) instead of HTML strings. No HTML-in-JSON escaping problems.
+* **Partial updates.** Actions return either a full page or a short list of DOM operations (`replace`, `append`, `prepend`, `remove`) that the client applies without reloading.
+* **Zero-LLM fast path.** Pure UI actions such as toggles and tab switches are handled by the server without a model call.
+* **Shared memory across apps.** Generated apps store entities (contacts, messages, tasks) in a shared SQLite store. A contact created on `/whatsapp` can appear on `/instagram`.
+* **Progressive asset discovery.** The model sees a short list of asset categories and can ask once for the entries it needs. It references images by ID (`asset:icon-chat`), never by URL.
+* **Model modes for rate limits.** Set in `.env`: `mock` (default, offline fixtures), `direct` (one call per generation), `batched` (bursts of actions combined into one call). All modes share a requests-per-minute limit.
+* **Per-app themes.** Each generated app can pick colors, radius, font, and density from bounded tokens.
+* **Static start page.** `/` serves a static `index.html` that explains the project.
 
 ---
 
 ## Repository Structure
 
-The codebase is organized around **Ports and Adapters (Hexagonal Architecture)**:
+The code follows a ports-and-adapters layout. The `compiler` package is the security core: every byte of HTML that reaches a browser passes through it.
 
 ```text
 laadan-engine/
-├── docs/                           # Architecture specifications and protocol blueprints
-│   ├── architecture.md             # System design, formal state model, and layer contracts
-│   ├── security-model.md           # Threat model, sanitization pipeline, and CSP boundaries
-│   └── page-document-spec.md       # Typed Component AST and Agentic Action Listener spec
-├── src/
-│   └── laadan/
-│       ├── domain/                 # Core entities, evidential types (@wa..@wi), CarrierBag contracts
-│       ├── application/            # Routing, action coalescing, fast-path dispatch, page compiler
-│       └── adapters/               # Inbound and outbound technical adapters
-│           ├── web/                # Inbound: FastAPI loopback gateway, static index.html, client JS
-│           ├── models/             # Outbound: MockModelGateway and HTTP LLM provider clients
-│           ├── storage/            # Outbound: SQLite CarrierBag store and session cache
-│           └── security/           # Outbound: nh3 sanitizer, selectolax inspector, token allowlists
+├── docs/
+│   ├── architecture.md          # Components, request flows, model modes, formal core
+│   ├── security-model.md        # Threats, controls, limits, residual risks
+│   └── page-document-spec.md    # Component catalog and action protocol (draft)
+├── src/laadan/
+│   ├── domain/                  # Pydantic models: components, actions, entities, evidentials, limits
+│   ├── compiler/                # Validate, render (Jinja2), sanitize (nh3), verify (selectolax)
+│   ├── application/             # Use cases, ports, context building, rate limiting, batching
+│   └── adapters/
+│       ├── web/                 # FastAPI app, security headers, origin checks, static files, client script
+│       ├── models/              # Mock gateway (default) and OpenAI-compatible HTTP gateway
+│       └── storage/             # SQLite entity store and page store
 ├── tests/
-│   ├── unit/                       # Fast unit tests for domain types, AST schemas, and sanitizers
-│   ├── integration/                # End-to-end request/action flows using MockModelGateway
-│   └── security/                   # XSS, CSS exfiltration, DOM clobbering, and fuzzing suites
-├── .env.example                    # Local environment template (defaults to loopback + mock mode)
-├── pyproject.toml                  # Dependencies and strict tooling config (mypy, ruff, pytest)
-└── AGENTS.md                       # Working agreement and safety rules for contributors and AI tools
+│   ├── unit/
+│   ├── integration/             # Request and action flows against the mock gateway
+│   └── security/                # Hostile model outputs and output-check tests
+├── .env.example                 # Local configuration template (loopback, mock mode)
+├── pyproject.toml
+└── AGENTS.md                    # Working rules for contributors and coding assistants
 ```
 
 ---
 
 ## Roadmap
 
-This repository currently contains the **Phase 0 architecture specification and project skeleton**. Implementation proceeds iteratively across four milestones:
+The repository currently contains design documents and the package skeleton. There is no runtime code yet.
 
-* [x] **Phase 0: Architecture Blueprint & Package Skeleton** (Current commit - specs, schemas, directory structure, tooling config)
-* [ ] **Phase 1: Minimal Safe Kernel** (FastAPI loopback server, static `index.html`, Pydantic AST models, `nh3` sanitizer, `MockModelGateway`)
-* [ ] **Phase 2: Client Runtime & Agentic Action Listeners** (`laadan-client.js`, `data-laadan-*` context gathering, partial DOM morphing)
-* [ ] **Phase 3: Dynamic Vibe Routing & Rate-Limit Coalescer** (Arbitrary browser/API routes, `direct` and `batched` execution modes, Zero-LLM Fast-Path)
-* [ ] **Phase 4: CarrierBag Cross-App Memory & Progressive Asset Discovery** (SQLite cross-route entity persistence, token-efficient symbolic asset catalog)
-
-Detailed specifications live in [`docs/architecture.md`](docs/architecture.md), [`docs/security-model.md`](docs/security-model.md), and [`docs/page-document-spec.md`](docs/page-document-spec.md).
+* [x] **Phase 0: Design and skeleton.** Architecture, security model, component draft, package layout, tooling config.
+* [ ] **Phase 1: Safe core.** Domain models, compiler (render, sanitize, verify), static `index.html`, mock gateway, hostile-output test suite.
+* [ ] **Phase 2: Client and actions.** Client script, action endpoint, fast path, partial updates.
+* [ ] **Phase 3: Generated routes and model modes.** Arbitrary routes, JSON API mode, `direct` and `batched` modes, rate limiter.
+* [ ] **Phase 4: Shared memory and assets.** Cross-app entity store, asset catalog with progressive discovery.
 
 ---
 

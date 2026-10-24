@@ -1,6 +1,6 @@
-"""Storage & Persistence Adapters.
+"""Storage Adapters.
 
-Outbound adapters for state persistence:
-- SQLite entity repository (CarrierBag store)
-- In-memory ephemeral session cache
+Outbound adapters for persistence:
+- SQLite entity store (shared memory across generated apps)
+- Page store (current validated page document per route)
 """

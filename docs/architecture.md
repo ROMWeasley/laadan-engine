@@ -1,205 +1,263 @@
-# System Architecture: Láadan Engine
+# Architecture
 
-**Status:** Design Proposal (Phase 0 Blueprint)  
-**Scope:** Runtime Kernel, Evidential Type System, State Persistence, and Execution Modes  
-
----
-
-## 1. Architectural Goal
-
-`laadan-engine` is designed as a generative web and API server ("vibe-server") that responds to arbitrary browser navigation (`GET /whatsapp`, `GET /instagram`, `GET /kanban`), interactive UI clicks (`POST /api/v1/action`), and synthetic API calls (from Postman, `curl`, or HTTP clients) by generating working interfaces and state transitions on the fly.
-
-The central engineering constraint is **Zero Eval with Maximum UI Capability**:
-* The client browser never executes model-generated JavaScript, inline event handlers, or unvalidated CSS.
-* At the same time, generated applications are not limited to static text: they support interactive forms, partial DOM morphing without full-page reloads, custom per-app visual theming, cross-app shared memory, and open-ended domain actions.
-
-### Core System Invariants
-
-1. **Zero Client-Side Code Generation:** The browser runs a single, fixed Vanilla JS runtime (`laadan-client.js`, ~4 KB) using event delegation (`data-laadan-*` attributes) and live DOM morphing. The language model emits zero executable scripts.
-2. **Evidential Taint Tracking (`@we` → `@wi`):** All model output starts as conjectural data (`@we`). It cannot mutate state or reach the client until validated and compiled by deterministic server code into verified output (`@wi`).
-3. **Two-Tier Capability Dispatch:** Client actions resolve either through a deterministic server-side **Fast-Path** (zero LLM tokens) or through a schema-bounded **Generative Intent Handler** that updates state and requests a typed UI patch from the model.
-4. **Loopback & Offline by Default:** The server binds to `127.0.0.1` and defaults to `LAADAN_EXECUTION_MODE=mock`. External LLM calls are opt-in.
+**Status:** Design proposal. Nothing described here is implemented yet.
 
 ---
 
-## 2. Container & Request Flow Architecture
+## 1. Goal and Constraints
+
+`laadan-engine` answers arbitrary requests (browser navigation, button clicks, API calls) with generated pages, partial page updates, or JSON responses.
+
+Fixed constraints:
+
+* **Model output is data.** It is parsed as JSON into typed models and never executed, evaluated, or used as template source, SQL, file path, or URL to fetch.
+* **The server renders all HTML.** The browser runs one fixed script and receives only HTML produced by application-owned templates.
+* **Local and offline by default.** The server binds to `127.0.0.1`, and the default model mode is `mock`, which makes no network calls.
+* **Single local user in v1.** There are no accounts or sessions. Multi-user operation is out of scope for v1 (see [security model, section 9](security-model.md#9-residual-risks-and-later-work)).
+
+---
+
+## 2. Packages (Ports and Adapters)
 
 ```mermaid
 flowchart TD
-    subgraph Client["Client Tier - Browser and API Clients"]
-        BrowserDOM["Browser DOM and Static index.html"]
-        ClientRuntime["laadan-client.js - 4 KB Event Delegation and Morpher"]
-        APIClient["Postman / curl / HTTP Client"]
-        BrowserDOM --> ClientRuntime
-        ClientRuntime --> BrowserDOM
-    end
-
-    subgraph Gateway["Inbound Web Tier - adapters.web"]
-        FastAPIGW["FastAPI Loopback Gateway - 127.0.0.1"]
-        HeaderPolicy["CSP Level 3 and Security Headers"]
-        RouteDispatcher["Route Matcher - Static index.html vs Synthetic Routes"]
-    end
-
-    subgraph Core["Application Kernel - application"]
-        ActionCoalescer["Rate-Limit Coalescer - mock, direct, batched"]
-        ActionRouter["Two-Tier Action Dispatcher"]
-        PageCompiler["Deterministic Page and Fragment Compiler - Jinja2"]
-        GlitchBoundary["GlitchBoundary - Fallback Resolver"]
-    end
-
-    subgraph Security["Sanitization and Asset Tier - adapters.security"]
-        HTMLSanitizer["nh3 RichText Sanitizer and selectolax Inspector"]
-        ThemeValidator["Theme and Utility Class Token Validator"]
-        AssetCatalog["Progressive Asset Catalog - /static/assets/"]
-    end
-
-    subgraph Storage["Persistence Tier - adapters.storage"]
-        SessionStore["Session State Store"]
-        CarrierBagDB["CarrierBag Cross-App Memory - SQLite"]
-    end
-
-    subgraph Models["Outbound Model Tier - adapters.models"]
-        ModelPort["ModelGateway - Mock Fixtures or Remote LLM"]
-    end
-
-    BrowserDOM -->|"GET / or GET /<app-route>"| FastAPIGW
-    ClientRuntime -->|"POST /api/v1/action"| FastAPIGW
-    APIClient -->|"GET or POST Synthetic API Request"| FastAPIGW
-
-    FastAPIGW --> HeaderPolicy
-    HeaderPolicy --> RouteDispatcher
-
-    RouteDispatcher -->|"Static Route (/)"| FastAPIGW
-    RouteDispatcher -->|"Synthetic Route or Action"| ActionCoalescer
-
-    ActionCoalescer --> ActionRouter
-    ActionRouter -->|"1. Zero-LLM Fast-Path"| PageCompiler
-    ActionRouter -->|"2. Generative Intent"| ModelPort
-
-    ActionRouter --> SessionStore
-    ActionRouter --> CarrierBagDB
-    CarrierBagDB --> ModelPort
-    AssetCatalog -->|"Progressive Resource Discovery"| ModelPort
-
-    ModelPort -->|"Typed Proposal (@we)"| GlitchBoundary
-    GlitchBoundary --> PageCompiler
-
-    PageCompiler --> HTMLSanitizer
-    PageCompiler --> ThemeValidator
-    PageCompiler --> AssetCatalog
-    HTMLSanitizer -->|"Verified HTML or DOM Patch (@wi)"| FastAPIGW
+    Web["adapters.web"] --> App["application"]
+    App --> Compiler["compiler"]
+    App --> Domain["domain"]
+    Compiler --> Domain
+    Models["adapters.models"] -->|"implements ModelGateway"| App
+    Storage["adapters.storage"] -->|"implements PageStore, EntityStore"| App
 ```
 
----
+| Package | Responsibility | May import |
+| :--- | :--- | :--- |
+| `domain` | Pydantic models: components, page documents, actions, entity operations, theme tokens, evidentials, limits. No I/O. | Pydantic |
+| `compiler` | Security core. Turns validated domain objects into HTML: render (Jinja2), sanitize `RichText` (nh3), verify output (selectolax). No network, storage, or model access. | `domain`, Jinja2, nh3, selectolax |
+| `application` | Use cases (load page, run action, answer API request), context building, rate limiting, batching. Defines the ports. | `domain`, `compiler` |
+| `adapters.web` | FastAPI app, routing, security headers, origin checks, static files, client script. | `application` |
+| `adapters.models` | `MockModelGateway` (fixtures, including hostile ones) and an OpenAI-compatible HTTP gateway. | `application` ports |
+| `adapters.storage` | SQLite entity store and page store. | `application` ports |
 
-## 3. Evidential Type System & Formal Runtime Model
+Ports defined in `application`:
 
-Created in 1982 by linguist and feminist author Suzette Haden Elgin, the constructed language **Láadan** requires every statement to carry an evidential morpheme indicating how the speaker knows the claim to be true. `laadan-engine` adapts this principle into a taint-tracking type system across the request lifecycle:
+* **`ModelGateway`**: sends a prompt and a JSON Schema, returns raw text. The gateway does not parse or trust the text.
+* **`PageStore`**: stores the current validated page document per route.
+* **`EntityStore`**: stores shared entities with their evidential.
 
-| Morpheme | Enum Member | Literal Meaning in Láadan | Meaning in `laadan-engine` |
-| :--- | :--- | :--- | :--- |
-| **`@wahel`** | `Evidence.UNTRUSTED` | No evidence / ungrounded | Raw incoming HTTP bytes, query strings, and unparsed JSON payloads before validation. |
-| **`@wa`** | `Evidence.PERCEIVED` | Directly perceived by senses | Schema-validated user interactions (`ActionEnvelope`, form values, route parameters). |
-| **`@we`** | `Evidence.CONJECTURAL` | **Perceived in a dream** | Raw LLM output (`PageDocument` AST proposal, entity updates). Treated as a hallucination until checked. |
-| **`@wi`** | `Evidence.VERIFIED` | Self-evident / proven | Deterministically compiled HTML fragments, sanitized rich text, and committed `CarrierBag` state. |
-
-### Formal State Transition & Type Promotion
-
-To make the boundary between probabilistic model outputs and deterministic execution explicit, the runtime can be viewed as a typed state machine over application state $S_t$ (the `CarrierBag`) and client view $V_t$:
-
-#### Ingress Parsing (`@wahel` → `@wa`)
-An incoming raw request $r \in \mathcal{T}_{\text{wahel}}$ is parsed by a strict Pydantic validator $\phi_{\text{in}}$:
-
-$$
-a_{\text{wa}} = \phi_{\text{in}}(r)
-$$
-
-If validation fails, the request is rejected at the gateway before touching state or models.
-
-#### Two-Tier Dispatch: Fast-Path vs. Generative Path
-
-**Deterministic Fast-Path:** If the action $a_{\text{wa}}$ uses a local UI primitive (such as `ui.toggle` or `ui.switch_tab`), the transition function $\delta_{\text{fast}}$ computes the next state and view directly without calling the model:
-
-$$
-(S_{t+1}, V_{t+1}^{\text{wi}}) = \delta_{\text{fast}}(S_t, a_{\text{wa}})
-$$
-
-**Generative Path:** For open-ended routes or domain intents, the model gateway $M$ proposes a candidate AST and state delta typed as conjectural (`@we`):
-
-$$
-p_{\text{we}} \sim M(S_t, a_{\text{wa}}, C_{\text{assets}})
-$$
-
-Because $p_{\text{we}} \in \mathcal{T}_{\text{we}}$ ("seen in a dream"), it cannot be sent to the browser directly. It must pass through the deterministic compiler $\kappa$ (Pydantic AST validation + `nh3` sanitization + asset resolution), with fallback boundary $B_{\text{glitch}}$ on failure:
-
-$$
-(S_{t+1}, V_{t+1}^{\text{wi}}) = 
-\begin{cases} 
-\kappa(S_t, p_{\text{we}}) & \text{if } p_{\text{we}} \text{ is valid} \\
-(S_t, B_{\text{glitch}}(p_{\text{we}})) & \text{otherwise} 
-\end{cases}
-$$
-
-#### Rate-Limit Coalescing (`batched` mode)
-When a user triggers a burst of actions $(a_1, a_2, \dots, a_k)$ within a debounce window $\Delta t$ (e.g. 250 ms), the coalescing buffer folds them into a single composite intent before invoking $M$ once, keeping request volume within strict provider RPM limits:
-
-$$
-\tilde{a} = a_1 \oplus a_2 \oplus \dots \oplus a_k
-$$
+The asset catalog is a static manifest in the repository and is read as domain data, not through a port.
 
 ---
 
-## 4. Core Subsystems in Detail
+## 3. Routes
 
-### 4.1 Static Anchor (`index.html`) vs. Synthetic Vibe Routes
-* **Root Anchor (`GET /`):** Serves a static `index.html` landing page that explains the engine, displays runtime status (current execution mode, active `CarrierBag` entities), and offers entry links into synthetic routes.
-* **Synthetic Browser Routes (`GET /<app-name>`):** Any path not matching `/static/*` or `/api/*` is treated as a synthetic application route. If the route already has cached structure in the session, it hydrates from state; otherwise, it generates a fresh `PageDocument` AST tailored to that route.
-* **Synthetic API Endpoints (`Accept: application/json`):** Requests from Postman, `curl`, or scripts targeting arbitrary paths can receive structured, schema-validated JSON responses backed by the same `CarrierBag` state store, making it possible to test backend endpoints and browser UIs against the same shared data.
+| Path | Handling |
+| :--- | :--- |
+| `/` | Static `index.html`. No model call. |
+| `/static/*` | Files shipped with the package: client script, stylesheet, assets. |
+| `/_laadan/action` | `POST` endpoint for button actions. |
+| `/_laadan/theme/{app}.css` | Stylesheet generated from an app's validated theme tokens. |
+| `/favicon.ico`, `/robots.txt`, `/.well-known/*` | Static file or `404`. Never generated. |
+| Anything else | Generated route if it matches the route pattern, otherwise `404`. |
 
-### 4.2 Cross-App Memory (`CarrierBag`)
-Instead of isolating every generated page in a throwaway prompt, `laadan-engine` persists domain objects in a shared SQLite store called the **`CarrierBag`**:
-* Entities are stored as typed records (`EntityNode`: e.g., `contact`, `message`, `note`, `task`, `profile`) with JSON attributes and provenance metadata (`created_by_route`, `evidence`).
-* **Example Flow:** A user opens `/whatsapp` and creates a contact *"Ada Lovelace"* via an Agentic Action Listener. The action stores the `contact` entity in the `CarrierBag`. When the user later navigates to `/instagram` or queries `GET /api/contacts` in Postman, the kernel injects the relevant `CarrierBag` entities into the model context so *"Ada Lovelace"* appears consistently across applications.
-
-### 4.3 Progressive Resource Discovery (`AssetCatalog`)
-Allowing an LLM to invent external `<img src="https://...">` URLs leads to broken images, tracking pixels, or Server-Side Request Forgery (SSRF). Conversely, pasting a catalog of 500 local icons into every system prompt wastes context tokens.
-* `laadan-engine` uses **Progressive Resource Discovery**: the local `/static/assets/` catalog indexes verified SVGs and images by category, tags, aspect ratio, and dimensions.
-* During generation, the kernel provides only compact category summaries or matches relevant to the route intent (e.g., chat icons for `/whatsapp`, media cards for `/instagram`).
-* The model references assets symbolically (`{"type": "Asset", "props": {"id": "asset:avatar-default"}}`), and the `PageCompiler` resolves them to local, hash-verified static files (or a safe fallback SVG if an ID does not exist).
-
-### 4.4 Rate-Limit Modes (`mock`, `direct`, `batched`)
-Configured via `LAADAN_EXECUTION_MODE` in `.env`:
-* **`mock` (Default):** Uses `MockModelGateway` with deterministic local fixtures. Requires zero API keys, makes zero network calls, and runs integration tests at full speed.
-* **`direct`:** Sends each generative request directly to the configured LLM provider with retry/backoff.
-* **`batched`:** Queues rapid UI actions in an asynchronous coalescing buffer (`LAADAN_ACTION_COALESCE_DEBOUNCE_MS=250`), merging intermediate clicks or filter changes into one batched LLM call to respect tight requests-per-minute (RPM) quotas.
+Route pattern: up to four segments of lowercase letters, digits, and hyphens, each up to 48 characters (for example `/whatsapp/chats/ada`). The first segment is the **app** (`whatsapp`); pages of the same app share a theme and navigation context.
 
 ---
 
-## 5. Layer Responsibilities (Ports & Adapters)
+## 4. Request Flows
 
-```text
-[ Inbound Adapters: FastAPI Web Gateway, Static index.html, laadan-client.js ]
-                                     │
-                                     ▼
-[ Application Layer: Route Dispatcher, Coalescer, Action Router, PageCompiler ]
-                                     │
-                                     ▼
-[ Domain Layer: Evidential Types (@wahel..@wi), AST Models, CarrierBag Entities ]
-                                     ▲
-                                     │
-[ Outbound Adapters: Models (Mock/HTTP), Storage (SQLite), Security (nh3/selectolax) ]
+### 4.1 First visit to `/`
+
+The server returns the static `index.html` with security headers. The page loads `/static/laadan.css` and `/static/laadan-client.js`. No model is involved.
+
+### 4.2 First visit to a generated route
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant W as Web adapter
+    participant A as Application
+    participant M as Model gateway
+    participant C as Compiler
+    participant S as Stores
+    B->>W: GET /whatsapp
+    Note over W: Host, origin, and route checks
+    W->>A: load page /whatsapp
+    A->>S: stored page for /whatsapp?
+    S-->>A: none
+    Note over A: rate limit, build context
+    A->>M: prompt and component schema
+    M-->>A: raw JSON text, evidential we
+    A->>C: parse and validate
+    C-->>A: page document or error
+    A->>S: apply entity operations, store page
+    A->>C: render, sanitize, verify
+    C-->>A: HTML
+    A-->>W: HTML
+    W-->>B: HTML with security headers
 ```
 
-* **`src/laadan/domain/`:** Pure Python and Pydantic v2 models with zero I/O or web framework imports. Defines `Evidence`, `PageDocument` AST nodes, `ActionEnvelope`, and `CarrierBag` entity contracts.
-* **`src/laadan/application/`:** Orchestrates the request lifecycle: `SemanticRouter`, `ActionCoalescer` (rate-limit batching), `FastPathDispatcher` (zero-LLM UI updates), `PageCompiler` (Jinja2 rendering), and `GlitchBoundary`.
-* **`src/laadan/adapters/web/`:** FastAPI loopback gateway (`127.0.0.1`), CSP headers, static `index.html`, and the ~4 KB `laadan-client.js` script.
-* **`src/laadan/adapters/models/`:** `ModelGateway` port implementations (`MockModelGateway` and OpenAI-compatible structured output clients).
-* **`src/laadan/adapters/storage/`:** SQLite repository for `CarrierBag` cross-app persistence and in-memory session state.
-* **`src/laadan/adapters/security/`:** `nh3` (Rust `ammonia`) sanitizer for `RichText` fragments, `selectolax` (C `lexbor`) parser for fast server-side HTML tree inspection and test assertions, and allowlist validators for CSS utility classes and theme tokens.
+1. The web adapter checks the `Host` header, the request's origin (section 4.6), and the route pattern.
+2. The application finds no stored page and acquires a slot from the rate limiter.
+3. It builds the context (section 6) and calls the model gateway with the JSON Schema of the allowed response types.
+4. The compiler parses the text as JSON and validates it against the Pydantic models and limits. Asset IDs and action targets must exist.
+5. Valid entity operations are written to the entity store, marked `we`.
+6. The page document is stored. The server assigns every button a stable action ID.
+7. The compiler renders the server-owned shell (`wi`) and the page body, sanitizes `RichText`, and verifies the result.
+8. If any step from 4 to 7 fails, the response is a fallback page (`GlitchBoundary`) with a retry button. The rejected output is logged locally.
+
+Only one generation per route runs at a time. A second request for the same route waits for the first one.
+
+### 4.3 Revisiting a route
+
+The stored page document is rendered again. No model call. The shell contains a **Regenerate** button (a server-owned action) that discards the stored page and generates a new one.
+
+### 4.4 Sub-routes and new apps
+
+* **`/whatsapp/chats/ada`** follows the flow in 4.2. The context also includes the stored theme and navigation of the `whatsapp` app and entities that match the route segments (for example a contact named Ada).
+* **`/instagram`** is a new app. Its context includes shared entities from other apps, labeled with their evidential, so a contact created on `/whatsapp` can appear here.
+* Links between pages are normal `<a href>` navigations. Each one is a `GET` and follows 4.2 or 4.3.
+
+### 4.5 Clicking a button
+
+```mermaid
+sequenceDiagram
+    participant B as Client script
+    participant W as Web adapter
+    participant A as Application
+    participant M as Model gateway
+    participant C as Compiler
+    B->>W: POST /_laadan/action with route, action ID, values
+    Note over W: Host, origin, content type, size checks
+    W->>A: run action
+    Note over A: load stored page, look up action definition
+    alt UI-only action
+        A->>C: render changed subtree
+    else Intent action
+        A->>M: prompt with page summary, intent, values
+        M-->>A: raw JSON update proposal
+        A->>C: parse, validate, render, verify
+    end
+    C-->>A: HTML fragments
+    A-->>W: list of DOM operations
+    W-->>B: JSON response
+    Note over B: apply operations inside the app root
+```
+
+1. The client script finds the clicked element's `data-laadan-action` ID, collects input values from the enclosing `data-laadan-scope` element and from elements listed in `data-laadan-include`, and sends a JSON envelope.
+2. The server loads the stored page for the route and looks up the action definition by ID. Unknown IDs (for example after a regeneration) return a `reload` operation.
+3. The submitted value names must match the inputs that the stored page actually has in that scope.
+4. **UI-only actions** (`toggle`, tab switches) change the stored page state and re-render the affected subtree. No model call.
+5. **Intent actions** send the intent label, its stored payload, the values, and a compact page summary to the model. The model returns an update proposal: DOM operations whose content is component nodes, plus entity operations. Targets must exist in the stored page.
+6. The response is a list of DOM operations with server-rendered HTML fragments. The client applies them only to elements inside the app root.
+
+### 4.6 Requests from other websites and prefetches
+
+* A `Host` header outside `LAADAN_ALLOWED_HOSTS` is rejected. This blocks DNS rebinding.
+* A cross-site navigation (`Sec-Fetch-Site: cross-site`) to an ungenerated route gets a small confirmation page with a same-origin button instead of a generation.
+* Cross-site subresource requests (images, scripts, `fetch`) never trigger generation.
+* Prefetch requests (`Sec-Purpose: prefetch`) never trigger generation.
+
+Details: [security model, section 6](security-model.md#6-requests-from-other-websites).
+
+### 4.7 API requests
+
+Requests with `Accept: application/json` (and without `text/html`) are answered in JSON mode on the same routes. Example: `GET /api/contacts` in Postman.
+
+* The model returns an `api` proposal: an HTTP status from a fixed list, a JSON body, and entity operations.
+* The body is validated as plain JSON with depth and size limits and served as `application/json`. It is never rendered as HTML.
+* `POST`, `PUT`, `PATCH`, and `DELETE` are accepted in JSON mode. Request bodies must be JSON and within size limits. They are passed to the model as `wa` data.
+* Browser requests in JSON mode pass the same origin checks as actions.
 
 ---
 
-## 6. Related Specifications
+## 5. Model Modes and Rate Limits
 
-* Threat model, sanitization pipeline, and CSS/CSP boundaries: [`docs/security-model.md`](security-model.md)
-* Typed Component AST schema and Agentic Action Listener wire protocol: [`docs/page-document-spec.md`](page-document-spec.md)
+Configured with `LAADAN_MODEL_MODE`:
+
+| Mode | Behavior |
+| :--- | :--- |
+| `mock` (default) | `MockModelGateway` returns fixtures selected by route and intent. No network access, no API key. Includes hostile fixtures for the security tests. |
+| `direct` | One model call per generation or intent action. |
+| `batched` | Intent actions for the same route that arrive within `LAADAN_BATCH_WINDOW_MS` are sent as one model call. |
+
+All modes except `mock` share one sliding-window limiter. For every 60-second interval:
+
+$$
+\text{model calls in } [t,\; t + 60\,\text{s}) \;\le\; \texttt{LAADAN\_MODEL\_RPM}
+$$
+
+If no slot is free within `LAADAN_MODEL_MAX_WAIT_SECONDS`, the request receives a `429` page or response with `Retry-After`. UI-only actions and stored pages never use a slot.
+
+**Batching semantics.** The batch is sent as a list of actions in one prompt. The model returns one combined update. The last request of the batch receives all DOM operations; earlier requests receive `status: "merged"` with no operations. Page loads are not batched; they wait for a slot.
+
+---
+
+## 6. Context Building
+
+Each prompt is assembled from sections with fixed token budgets. Truncation is deterministic.
+
+| Section | Content | Evidential |
+| :--- | :--- | :--- |
+| System | Fixed instructions and the component catalog (generated from the Pydantic models). Identical across requests, so providers can cache it. | `wi` |
+| Request | Route, method, intent label, submitted values, request body | `wa` |
+| Page | Compact summary of the current page (for actions only): component types, IDs, visible texts | `we` |
+| App | Stored theme and navigation of the current app | `we` |
+| Memory | Up to N relevant entities: same app first, then entities whose fields match route segments or submitted values | per entity |
+| Assets | Category names with counts | `wi` |
+
+**Progressive asset discovery.** The model may answer with `need_assets` and up to five category names. The server replies once with compact entries for those categories (ID, description, dimensions), then expects a page or update. A second `need_assets` is a validation error. The model never sees file paths or URLs.
+
+Data sections are JSON-encoded and clearly delimited from the instructions. This helps the model separate instructions from data but is not a security boundary.
+
+---
+
+## 7. Formal Core
+
+The security argument for model output fits in a few lines. Let $s$ be any string the model returns. Nothing is assumed about the model; $s$ may be adversarial.
+
+$$
+\text{respond}(s) = \text{verify}\big(\text{render}(\text{validate}(s))\big)
+$$
+
+* $\text{validate}: \Sigma^* \to \mathcal{D} \cup \{\bot\}$ parses JSON into the closed set $\mathcal{D}$ of page documents (Pydantic models with fixed limits). Every other input yields $\bot$.
+* $\text{render}: \mathcal{D} \to \text{HTML}$ is defined by structural recursion over a fixed, finite set of templates. Every string leaf reaches the output through exactly one of three functions: $\text{escape}$ (text content), $\text{check}$ (enum or regex for attribute values), or $\text{sanitize}$ (nh3, `RichText` only). Tag names and attribute names are never taken from the model.
+* $\text{verify}: \text{HTML} \to \text{HTML} \cup \{\bot\}$ independently rejects forbidden constructs.
+* $\bot$ at any stage produces the fallback page.
+
+Claim:
+
+$$
+\forall s \in \Sigma^* :\quad \text{respond}(s) \in \mathcal{H}_{\text{safe}} \cup \{\text{fallback}\}
+$$
+
+$\mathcal{H}_{\text{safe}}$ is the set of HTML documents without script elements (other than the client script tag), event-handler attributes, style elements or attributes, and URLs outside the engine's own origin.
+
+Argument by induction over the document tree: the templates contain none of these constructs except the client script tag in the shell; $\text{escape}$, $\text{check}$, and $\text{sanitize}$ cannot introduce them; $\text{verify}$ enforces the same property a second time.
+
+The model does not appear in the argument. Safety is a property of the pipeline, not of the prompt or of the model behaving well. The argument is only as good as the templates, the nh3 configuration, and the HTML parsers involved, which is what the security test suite targets. It is a design argument, not a machine-checked proof.
+
+---
+
+## 8. Design Decisions
+
+* **Component tree instead of sanitized model HTML.** Sanitizing arbitrary HTML is a hard, moving target. A closed component set turns most of the problem into schema validation. Only `RichText` uses an HTML sanitizer, with a small allowlist.
+* **Own client script instead of htmx.** htmx can evaluate expressions from attributes (`hx-on`, `js:` values) and is larger than needed. A small fixed script that only knows server-issued action IDs and five DOM operations is easier to review completely.
+* **No tool calling in v1.** The model has no functions to call. Progressive discovery uses a typed `need_assets` response instead.
+* **Server-stored actions.** Buttons carry an ID, not a description of what they do. Action definitions, including model-supplied payloads, never round-trip through the browser.
+* **Security limits are code constants.** Size, depth, and count limits live in `domain` and cannot be loosened through `.env`.
+* **Single local user.** No sessions and no cookies in v1. Cross-site protection relies on host, origin, and content-type checks (security model, section 6).
+
+---
+
+## 9. Open Questions
+
+* **Provider schema support.** Structured-output modes of some providers accept only a subset of JSON Schema (for example around unions and recursion). A simplified schema may be needed for the provider; server-side validation stays the authority either way.
+* **Morphing.** A `morph` operation that keeps focus and scroll position is planned after `replace` works. Its size must fit the client script budget.
+* **Entity relevance.** Keyword matching is the starting point. Better selection should stay deterministic and cheap.
+
+---
+
+## 10. Related Documents
+
+* [Security model](security-model.md)
+* [Page document and action protocol](page-document-spec.md)

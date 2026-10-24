@@ -1,1 +1,1 @@
-"""Security and fuzzing test suite for XSS, injection vectors, and boundary guarantees."""
+"""Security test suite: hostile model outputs, injection vectors, output checks, and headers."""

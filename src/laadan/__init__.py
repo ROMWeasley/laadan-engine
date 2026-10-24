@@ -1,3 +1,6 @@
-"""Laadan Engine: A server-driven web runtime for generative interfaces with zero client-side eval."""
+"""Laadan Engine: a server-driven runtime for model-generated web interfaces.
 
-__version__ = "0.1.0-dev"
+Model output is treated as data and is never executed.
+"""
+
+__version__ = "0.1.0.dev0"

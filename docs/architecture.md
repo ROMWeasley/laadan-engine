@@ -183,7 +183,7 @@ Configured with `LAADAN_MODEL_MODE`:
 All modes except `mock` share one sliding-window limiter. For every 60-second interval:
 
 $$
-\text{model calls in } [t,\; t + 60\,\text{s}) \;\le\; \texttt{LAADAN\_MODEL\_RPM}
+\text{model calls in } [t,\; t + 60\,\text{s}) \;\le\; \text{LAADAN\_MODEL\_RPM}
 $$
 
 If no slot is free within `LAADAN_MODEL_MAX_WAIT_SECONDS`, the request receives a `429` page or response with `Retry-After`. UI-only actions and stored pages never use a slot.
